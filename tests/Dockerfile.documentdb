@@ -1,0 +1,29 @@
+ARG DOCUMENTDB_IMAGE=ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0
+ARG PG_MAJOR=17
+FROM docker.io/library/postgres:${PG_MAJOR}-bookworm AS build
+ARG PG_MAJOR
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends \
+       build-essential postgresql-server-dev-${PG_MAJOR} python3-psycopg2 \
+       pkg-config libbson-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /usr/src/documentdb-changefeed
+WORKDIR /usr/src/documentdb-changefeed
+RUN make -s -j2 && make -s install
+
+FROM ${DOCUMENTDB_IMAGE}
+ARG PG_MAJOR
+USER root
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends python3-psycopg2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_changefeed.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY documentdb_changefeed.control sql/documentdb_changefeed--0.1.0.sql /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY . /usr/src/documentdb-changefeed
+WORKDIR /usr/src/documentdb-changefeed
+USER documentdb
+ENTRYPOINT ["/bin/bash", "scripts/start-test-postgres.sh"]
