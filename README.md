@@ -9,6 +9,14 @@ Its installation SQL currently exposes only a restricted `version()` function.
 There is no capture policy, managed retention, continuation token, public feed,
 or MongoDB change-stream provider yet.
 
+## Install into DocumentDB Local
+
+See [the container installation guide](docs/documentdb-local.md) for installing
+the module into a normal DocumentDB Local image, building the companion core
+patch, enabling logical WAL, and checking SQL installation and MongoDB access.
+The `local` Dockerfile target preserves the upstream gateway entrypoint; the
+default target is only for SQL fixtures.
+
 ## Decoder feasibility fixtures
 
 The private, superuser-only fixture decoder scans retained local WAL once per

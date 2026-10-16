@@ -1,0 +1,455 @@
+diff --git a/pg_documentdb/Makefile b/pg_documentdb/Makefile
+index 347790ef4..3149fa863 100644
+--- a/pg_documentdb/Makefile
++++ b/pg_documentdb/Makefile
+@@ -75,6 +75,10 @@ check-extended-rum:
+ check-minimal:
+ 	$(MAKE) -C src/test/regress check-minimal
+ 
++.PHONY: check-changefeed-hooks
++check-changefeed-hooks:
++	$(MAKE) -C src/test/changefeed all installcheck
++
+ check-documentdb-minimal: check-minimal
+ 
+ check-extended-rum-minimal:
+diff --git a/pg_documentdb/include/api_hooks.h b/pg_documentdb/include/api_hooks.h
+index ec37defe2..7338ded6d 100644
+--- a/pg_documentdb/include/api_hooks.h
++++ b/pg_documentdb/include/api_hooks.h
+@@ -34,6 +34,9 @@ bool IsMetadataCoordinator(void);
+  */
+ bool IsClusterInitialized(void);
+ 
++/* Defaults to false when no external capture provider is registered. */
++bool ChangeStreamRequiresFullReplicaIdentity(const MongoCollection *collection);
++
+ 
+ /*
+  * Runs a command on the MetadataCoordinator if the current node is not a
+diff --git a/pg_documentdb/include/api_hooks_def.h b/pg_documentdb/include/api_hooks_def.h
+index 0561e3cf9..3d3ebaa33 100644
+--- a/pg_documentdb/include/api_hooks_def.h
++++ b/pg_documentdb/include/api_hooks_def.h
+@@ -49,6 +49,17 @@ extern IsClusterInitialized_HookType is_cluster_initialized_hook;
+ typedef bool (*IsChangeStreamEnabledAndCompatible)(void);
+ extern IsChangeStreamEnabledAndCompatible is_changestream_enabled_and_compatible_hook;
+ 
++/*
++ * Reports whether an external capture provider requires FULL replica identity,
++ * independently of the user-visible pre-image option. Called with the
++ * collection locked exclusively; providers must serialize policy changes using
++ * the same lock and chain any previous hook with logical OR.
++ */
++typedef bool (*ChangeStreamRequiresFullReplicaIdentity_HookType)(const MongoCollection *
++															   collection);
++extern ChangeStreamRequiresFullReplicaIdentity_HookType
++	change_stream_requires_full_replica_identity_hook;
++
+ /*
+  * Runs a command on the MetadataCoordinator if the current node is not a
+  * Metadata Coordinator. The response is returned as a "record" struct
+diff --git a/pg_documentdb/src/api_hooks.c b/pg_documentdb/src/api_hooks.c
+index d8bf956d0..b8b1f14c9 100644
+--- a/pg_documentdb/src/api_hooks.c
++++ b/pg_documentdb/src/api_hooks.c
+@@ -51,6 +51,8 @@ TryGetShardNameForUnshardedCollection_HookType
+ 	try_get_shard_name_for_unsharded_collection_hook = NULL;
+ GetDistributedApplicationName_HookType get_distributed_application_name_hook = NULL;
+ IsChangeStreamEnabledAndCompatible is_changestream_enabled_and_compatible_hook = NULL;
++ChangeStreamRequiresFullReplicaIdentity_HookType
++	change_stream_requires_full_replica_identity_hook = NULL;
+ IsNtoReturnSupported_HookType is_n_to_return_supported_hook = NULL;
+ EnsureMetadataTableReplicated_HookType ensure_metadata_table_replicated_hook = NULL;
+ PostSetupCluster_HookType post_setup_cluster_hook = NULL;
+@@ -527,6 +529,17 @@ IsChangeStreamFeatureAvailableAndCompatible(void)
+ 	return false;
+ }
+ 
++bool
++ChangeStreamRequiresFullReplicaIdentity(const MongoCollection *collection)
++{
++	if (change_stream_requires_full_replica_identity_hook != NULL)
++	{
++		return change_stream_requires_full_replica_identity_hook(collection);
++	}
++
++	return false;
++}
++
+ 
+ /*
+  * Checks if server version supports ntoreturn spec.
+diff --git a/pg_documentdb/src/metadata/collection.c b/pg_documentdb/src/metadata/collection.c
+index 91301250a..9d722f5c4 100644
+--- a/pg_documentdb/src/metadata/collection.c
++++ b/pg_documentdb/src/metadata/collection.c
+@@ -2396,10 +2396,9 @@ ParseChangeStreamPreAndPostImageOption(const bson_value_t *optionValue,
+ 
+ /*
+  * UpdateChangeStreamPreAndPostImages checks the data table's current replica
+- * identity from pg_class syscache and ALTERs it to FULL (when enabled) or
+- * DEFAULT (when disabled) only if the current state differs. REPLICA IDENTITY
+- * FULL causes PostgreSQL to include the full old row in WAL for UPDATE/DELETE,
+- * which is needed for generating pre-images in change streams.
++ * identity and preserves FULL while either pre-images or an external capture
++ * provider requires it. The logical pre-image option is updated independently
++ * of whether the physical replica identity needs to change.
+  */
+ void
+ UpdateChangeStreamPreAndPostImages(MongoCollection *collection,
+@@ -2430,26 +2429,23 @@ UpdateChangeStreamPreAndPostImages(MongoCollection *collection,
+ 	ReleaseSysCache(classTuple);
+ 
+ 	bool isCurrentlyFull = (currentReplIdent == REPLICA_IDENTITY_FULL);
++	bool requiresFull = enabled || ChangeStreamRequiresFullReplicaIdentity(collection);
+ 
+-	/* Only ALTER if the desired state differs from the current state */
+-	if (enabled == isCurrentlyFull)
++	if (requiresFull != isCurrentlyFull)
+ 	{
+-		return;
+-	}
+-
+-	StringInfo command = makeStringInfo();
+-	appendStringInfo(command,
+-					 "ALTER TABLE %s.%s REPLICA IDENTITY %s",
+-					 ApiDataSchemaName,
+-					 collection->tableName,
+-					 enabled ? "FULL" : "DEFAULT");
++		StringInfo command = makeStringInfo();
++		appendStringInfo(command,
++						 "ALTER TABLE %s.%s REPLICA IDENTITY %s",
++						 ApiDataSchemaName,
++						 collection->tableName,
++						 requiresFull ? "FULL" : "DEFAULT");
+ 
+-	bool readOnly = false;
+-	bool resultIsNull = false;
+-	ExtensionExecuteQueryViaSPI(command->data, readOnly,
+-								SPI_OK_UTILITY, &resultIsNull);
+-
+-	pfree(command->data);
++		bool readOnly = false;
++		bool resultIsNull = false;
++		ExtensionExecuteQueryViaSPI(command->data, readOnly,
++									SPI_OK_UTILITY, &resultIsNull);
++		pfree(command->data);
++	}
+ 
+ 	pgbson_writer changeStreamOptions;
+ 	PgbsonWriterInit(&changeStreamOptions);
+diff --git a/pg_documentdb/src/test/changefeed/Makefile b/pg_documentdb/src/test/changefeed/Makefile
+new file mode 100644
+index 000000000..832e53dec
+--- /dev/null
++++ b/pg_documentdb/src/test/changefeed/Makefile
+@@ -0,0 +1,13 @@
++MODULES = changefeed_hooks_test
++PG_CPPFLAGS = -I../../../include -I../../../../pg_documentdb_core/include \
++	$(shell pkg-config --cflags libbson-1.0)
++PG_CFLAGS = -std=gnu99 -Wno-declaration-after-statement
++REGRESS = changefeed_replica_identity
++REGRESS_OPTS = --use-existing --dlpath=$(CURDIR)
++
++PG_CONFIG ?= pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++
++# DocumentDB must already be installed in the target database.
++CONTRIB_TESTDB = postgres
+diff --git a/pg_documentdb/src/test/changefeed/changefeed_hooks_test.c b/pg_documentdb/src/test/changefeed/changefeed_hooks_test.c
+new file mode 100644
+index 000000000..8773b8b8a
+--- /dev/null
++++ b/pg_documentdb/src/test/changefeed/changefeed_hooks_test.c
+@@ -0,0 +1,63 @@
++/*-------------------------------------------------------------------------
++ * Copyright (c) Microsoft Corporation. All rights reserved.
++ *
++ * Test-only capture provider for replica identity ownership.
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++#include "fmgr.h"
++#include "miscadmin.h"
++#include "io/bson_core.h"
++#include "api_hooks_def.h"
++
++PG_MODULE_MAGIC;
++
++static uint64 RequiredCollectionId = 0;
++static ChangeStreamRequiresFullReplicaIdentity_HookType PreviousHook = NULL;
++
++void _PG_init(void);
++void _PG_fini(void);
++PG_FUNCTION_INFO_V1(changefeed_test_require_full);
++
++static bool
++RequiresFull(const MongoCollection *collection)
++{
++	return (RequiredCollectionId != 0 &&
++			collection->collectionId == RequiredCollectionId) ||
++		   (PreviousHook != NULL && PreviousHook(collection));
++}
++
++void
++_PG_init(void)
++{
++	PreviousHook = change_stream_requires_full_replica_identity_hook;
++	change_stream_requires_full_replica_identity_hook = RequiresFull;
++}
++
++void
++_PG_fini(void)
++{
++	if (change_stream_requires_full_replica_identity_hook == RequiresFull)
++	{
++		change_stream_requires_full_replica_identity_hook = PreviousHook;
++	}
++}
++
++Datum
++changefeed_test_require_full(PG_FUNCTION_ARGS)
++{
++	int64 collectionId = PG_GETARG_INT64(0);
++
++	if (!superuser())
++	{
++		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++						errmsg("test capture provider requires superuser")));
++	}
++	if (collectionId < 0)
++	{
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("test collection ID cannot be negative")));
++	}
++	RequiredCollectionId = (uint64) collectionId;
++	PG_RETURN_VOID();
++}
+diff --git a/pg_documentdb/src/test/changefeed/expected/changefeed_replica_identity.out b/pg_documentdb/src/test/changefeed/expected/changefeed_replica_identity.out
+new file mode 100644
+index 000000000..83ed1b6be
+--- /dev/null
++++ b/pg_documentdb/src/test/changefeed/expected/changefeed_replica_identity.out
+@@ -0,0 +1,104 @@
++SET client_min_messages TO warning;
++SET documentdb.enablePreImages TO on;
++CREATE SCHEMA changefeed_test;
++CREATE FUNCTION changefeed_test.assert_state(collection_name text, identity "char", pre_images boolean)
++RETURNS void LANGUAGE plpgsql AS $$
++DECLARE
++    collection_id bigint;
++    actual_identity "char";
++    actual_pre_images boolean;
++BEGIN
++    SELECT c.collection_id,
++           (documentdb_core.bson_to_json_string(c.options)::text::jsonb
++               #>> '{changeStreamPreAndPostImages,enabled}')::boolean
++      INTO STRICT collection_id, actual_pre_images
++      FROM documentdb_api_catalog.collections c
++     WHERE c.database_name = 'changefeed_test' AND c.collection_name = assert_state.collection_name;
++    SELECT relreplident INTO STRICT actual_identity
++      FROM pg_class
++     WHERE oid = format('documentdb_data.documents_%s', collection_id)::regclass;
++    IF actual_identity IS DISTINCT FROM identity OR
++       coalesce(actual_pre_images, false) IS DISTINCT FROM pre_images THEN
++        RAISE EXCEPTION 'Unexpected state: identity %, pre-images %', actual_identity, actual_pre_images;
++    END IF;
++END
++$$;
++CREATE FUNCTION changefeed_test.set_pre_images(collection_name text, enabled boolean)
++RETURNS documentdb_core.bson LANGUAGE SQL AS $$
++    SELECT documentdb_api.coll_mod('changefeed_test', $1,
++        json_build_object('collMod', $1, 'changeStreamPreAndPostImages',
++            json_build_object('enabled', $2))::text::documentdb_core.bson);
++$$;
++DO $$
++DECLARE
++    owned_id bigint;
++BEGIN
++    PERFORM documentdb_api.create_collection('changefeed_test', 'ordinary');
++    PERFORM documentdb_api.create_collection('changefeed_test', 'owned');
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++
++    -- No provider: existing physical transitions and repeated calls still work.
++    PERFORM changefeed_test.set_pre_images('ordinary', true);
++    PERFORM changefeed_test.assert_state('ordinary', 'f', true);
++    PERFORM changefeed_test.set_pre_images('ordinary', true);
++    PERFORM changefeed_test.assert_state('ordinary', 'f', true);
++    PERFORM changefeed_test.set_pre_images('ordinary', false);
++    PERFORM changefeed_test.set_pre_images('ordinary', false);
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++
++    -- FULL set independently must not prevent enabling the logical option.
++    SELECT collection_id INTO STRICT owned_id FROM documentdb_api_catalog.collections
++     WHERE database_name = 'changefeed_test' AND collection_name = 'ordinary';
++    EXECUTE format('ALTER TABLE documentdb_data.documents_%s REPLICA IDENTITY FULL', owned_id);
++    PERFORM changefeed_test.set_pre_images('ordinary', true);
++    PERFORM changefeed_test.assert_state('ordinary', 'f', true);
++    PERFORM changefeed_test.set_pre_images('ordinary', false);
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++END
++$$;
++CREATE FUNCTION changefeed_test.require_full(bigint) RETURNS void
++AS 'changefeed_hooks_test', 'changefeed_test_require_full'
++LANGUAGE C STRICT;
++REVOKE ALL ON FUNCTION changefeed_test.require_full(bigint) FROM PUBLIC;
++DO $$
++DECLARE
++    owned_id bigint;
++BEGIN
++    SELECT collection_id INTO STRICT owned_id FROM documentdb_api_catalog.collections
++     WHERE database_name = 'changefeed_test' AND collection_name = 'owned';
++    PERFORM changefeed_test.require_full(owned_id);
++    -- An owner can require FULL even with logical pre-images disabled.
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'f', false);
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++    PERFORM changefeed_test.set_pre_images('owned', true);
++    PERFORM changefeed_test.assert_state('owned', 'f', true);
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'f', false);
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'f', false);
++
++    -- Metadata changes roll back while a provider keeps physical FULL.
++    PERFORM changefeed_test.set_pre_images('owned', true);
++    BEGIN
++        PERFORM changefeed_test.set_pre_images('owned', false);
++        PERFORM changefeed_test.assert_state('owned', 'f', false);
++        RAISE EXCEPTION 'rollback test' USING ERRCODE = 'ZX001';
++    EXCEPTION WHEN SQLSTATE 'ZX001' THEN
++        NULL;
++    END;
++    PERFORM changefeed_test.assert_state('owned', 'f', true);
++
++    -- Releasing capture does not disable pre-images; a later disable restores DEFAULT.
++    PERFORM changefeed_test.require_full(0);
++    PERFORM changefeed_test.set_pre_images('owned', true);
++    PERFORM changefeed_test.assert_state('owned', 'f', true);
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'd', false);
++    PERFORM documentdb_api.drop_collection('changefeed_test', 'ordinary');
++    PERFORM documentdb_api.drop_collection('changefeed_test', 'owned');
++END
++$$;
++DROP SCHEMA changefeed_test CASCADE;
++RESET documentdb.enablePreImages;
++RESET client_min_messages;
+diff --git a/pg_documentdb/src/test/changefeed/sql/changefeed_replica_identity.sql b/pg_documentdb/src/test/changefeed/sql/changefeed_replica_identity.sql
+new file mode 100644
+index 000000000..c80e08c53
+--- /dev/null
++++ b/pg_documentdb/src/test/changefeed/sql/changefeed_replica_identity.sql
+@@ -0,0 +1,110 @@
++SET client_min_messages TO warning;
++SET documentdb.enablePreImages TO on;
++CREATE SCHEMA changefeed_test;
++
++CREATE FUNCTION changefeed_test.assert_state(collection_name text, identity "char", pre_images boolean)
++RETURNS void LANGUAGE plpgsql AS $$
++DECLARE
++    collection_id bigint;
++    actual_identity "char";
++    actual_pre_images boolean;
++BEGIN
++    SELECT c.collection_id,
++           (documentdb_core.bson_to_json_string(c.options)::text::jsonb
++               #>> '{changeStreamPreAndPostImages,enabled}')::boolean
++      INTO STRICT collection_id, actual_pre_images
++      FROM documentdb_api_catalog.collections c
++     WHERE c.database_name = 'changefeed_test' AND c.collection_name = assert_state.collection_name;
++    SELECT relreplident INTO STRICT actual_identity
++      FROM pg_class
++     WHERE oid = format('documentdb_data.documents_%s', collection_id)::regclass;
++    IF actual_identity IS DISTINCT FROM identity OR
++       coalesce(actual_pre_images, false) IS DISTINCT FROM pre_images THEN
++        RAISE EXCEPTION 'Unexpected state: identity %, pre-images %', actual_identity, actual_pre_images;
++    END IF;
++END
++$$;
++
++CREATE FUNCTION changefeed_test.set_pre_images(collection_name text, enabled boolean)
++RETURNS documentdb_core.bson LANGUAGE SQL AS $$
++    SELECT documentdb_api.coll_mod('changefeed_test', $1,
++        json_build_object('collMod', $1, 'changeStreamPreAndPostImages',
++            json_build_object('enabled', $2))::text::documentdb_core.bson);
++$$;
++
++DO $$
++DECLARE
++    owned_id bigint;
++BEGIN
++    PERFORM documentdb_api.create_collection('changefeed_test', 'ordinary');
++    PERFORM documentdb_api.create_collection('changefeed_test', 'owned');
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++
++    -- No provider: existing physical transitions and repeated calls still work.
++    PERFORM changefeed_test.set_pre_images('ordinary', true);
++    PERFORM changefeed_test.assert_state('ordinary', 'f', true);
++    PERFORM changefeed_test.set_pre_images('ordinary', true);
++    PERFORM changefeed_test.assert_state('ordinary', 'f', true);
++    PERFORM changefeed_test.set_pre_images('ordinary', false);
++    PERFORM changefeed_test.set_pre_images('ordinary', false);
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++
++    -- FULL set independently must not prevent enabling the logical option.
++    SELECT collection_id INTO STRICT owned_id FROM documentdb_api_catalog.collections
++     WHERE database_name = 'changefeed_test' AND collection_name = 'ordinary';
++    EXECUTE format('ALTER TABLE documentdb_data.documents_%s REPLICA IDENTITY FULL', owned_id);
++    PERFORM changefeed_test.set_pre_images('ordinary', true);
++    PERFORM changefeed_test.assert_state('ordinary', 'f', true);
++    PERFORM changefeed_test.set_pre_images('ordinary', false);
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++END
++$$;
++
++CREATE FUNCTION changefeed_test.require_full(bigint) RETURNS void
++AS 'changefeed_hooks_test', 'changefeed_test_require_full'
++LANGUAGE C STRICT;
++REVOKE ALL ON FUNCTION changefeed_test.require_full(bigint) FROM PUBLIC;
++
++DO $$
++DECLARE
++    owned_id bigint;
++BEGIN
++    SELECT collection_id INTO STRICT owned_id FROM documentdb_api_catalog.collections
++     WHERE database_name = 'changefeed_test' AND collection_name = 'owned';
++    PERFORM changefeed_test.require_full(owned_id);
++    -- An owner can require FULL even with logical pre-images disabled.
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'f', false);
++    PERFORM changefeed_test.assert_state('ordinary', 'd', false);
++    PERFORM changefeed_test.set_pre_images('owned', true);
++    PERFORM changefeed_test.assert_state('owned', 'f', true);
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'f', false);
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'f', false);
++
++    -- Metadata changes roll back while a provider keeps physical FULL.
++    PERFORM changefeed_test.set_pre_images('owned', true);
++    BEGIN
++        PERFORM changefeed_test.set_pre_images('owned', false);
++        PERFORM changefeed_test.assert_state('owned', 'f', false);
++        RAISE EXCEPTION 'rollback test' USING ERRCODE = 'ZX001';
++    EXCEPTION WHEN SQLSTATE 'ZX001' THEN
++        NULL;
++    END;
++    PERFORM changefeed_test.assert_state('owned', 'f', true);
++
++    -- Releasing capture does not disable pre-images; a later disable restores DEFAULT.
++    PERFORM changefeed_test.require_full(0);
++    PERFORM changefeed_test.set_pre_images('owned', true);
++    PERFORM changefeed_test.assert_state('owned', 'f', true);
++    PERFORM changefeed_test.set_pre_images('owned', false);
++    PERFORM changefeed_test.assert_state('owned', 'd', false);
++    PERFORM documentdb_api.drop_collection('changefeed_test', 'ordinary');
++    PERFORM documentdb_api.drop_collection('changefeed_test', 'owned');
++END
++$$;
++
++DROP SCHEMA changefeed_test CASCADE;
++RESET documentdb.enablePreImages;
++RESET client_min_messages;

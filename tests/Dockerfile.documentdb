@@ -13,16 +13,19 @@ COPY . /usr/src/documentdb-changefeed
 WORKDIR /usr/src/documentdb-changefeed
 RUN make -s -j2 && make -s install
 
-FROM ${DOCUMENTDB_IMAGE}
+FROM ${DOCUMENTDB_IMAGE} AS local
 ARG PG_MAJOR
+
+COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_changefeed.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY documentdb_changefeed.control sql/documentdb_changefeed--0.1.0.sql /usr/share/postgresql/${PG_MAJOR}/extension/
+
+FROM local AS test
 USER root
 
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends python3-psycopg2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_changefeed.so /usr/lib/postgresql/${PG_MAJOR}/lib/
-COPY documentdb_changefeed.control sql/documentdb_changefeed--0.1.0.sql /usr/share/postgresql/${PG_MAJOR}/extension/
 COPY . /usr/src/documentdb-changefeed
 WORKDIR /usr/src/documentdb-changefeed
 USER documentdb
