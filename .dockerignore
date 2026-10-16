@@ -1,0 +1,7 @@
+.git
+*.o
+*.so
+*.bc
+__pycache__
+.github
+documentdb-source

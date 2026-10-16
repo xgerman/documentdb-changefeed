@@ -1,0 +1,6 @@
+comment = 'Experimental changefeed foundation for DocumentDB; no production feed API'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_documentdb_changefeed'
+relocatable = false
+superuser = true
+requires = 'documentdb_core, documentdb'

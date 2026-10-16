@@ -1,0 +1,33 @@
+name: Native decoder
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check public DocumentDB header compatibility
+        uses: actions/checkout@v4
+        with:
+          repository: documentdb/documentdb
+          ref: d9301892d7fa47b6f5bb923c93b1f6915c3b9bad
+          path: documentdb-source
+      - name: Build and exercise native WAL fixtures
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+          DOCUMENTDB_SOURCE: documentdb-source
+        run: bash scripts/test-container.sh
+  collections:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise actual DocumentDB collection APIs
+        env:
+          PG_MAJOR: 17
+          DOCUMENTDB_IMAGE: ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0
+        run: bash scripts/test-container.sh
