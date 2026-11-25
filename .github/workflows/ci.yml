@@ -1,4 +1,4 @@
-name: Native decoder
+name: Changefeed reference
 on: [push, pull_request]
 permissions:
   contents: read
@@ -30,4 +30,14 @@ jobs:
         env:
           PG_MAJOR: 17
           DOCUMENTDB_IMAGE: ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0
+        run: bash scripts/test-container.sh
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise logical decoding and client watch
+        env:
+          PG_MAJOR: 17
+          DOCUMENTDB_IMAGE: ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0
+          CHANGEFEED_LOGICAL_TEST: 1
         run: bash scripts/test-container.sh

@@ -16,8 +16,13 @@ RUN make -s -j2 && make -s install
 FROM ${DOCUMENTDB_IMAGE} AS local
 ARG PG_MAJOR
 
+USER root
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends libbson-1.0-0 postgresql-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_changefeed.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY documentdb_changefeed.control sql/documentdb_changefeed--0.1.0.sql /usr/share/postgresql/${PG_MAJOR}/extension/
+USER documentdb
 
 FROM local AS test
 USER root
