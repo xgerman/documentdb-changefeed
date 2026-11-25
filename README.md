@@ -2,16 +2,19 @@
 
 An experimental, separately installable collection `watch()` provider using
 PostgreSQL logical decoding and DocumentDB's existing aggregation/cursor UDF.
-The first reference supports **inserts and deletes with default replica
-identity**, per-event resume, independent readers, and filtered batches.
+The reference supports **inserts and deletes with default replica identity**,
+plus opt-in operator updates and replacements, per-event resume, independent
+readers, and filtered batches.
 It does not require the companion core patch or hook chaining.
 
-**Not production-ready.** Updates, replacements, pre-images, timestamp starts,
+**Not production-ready.** Positional updates, pre-images, timestamp starts,
 distribution, archives, and durable failover are unsupported. Slots are
 administrator-owned and retained history is not advanced automatically.
 Unsupported mutations fail explicitly rather than disappear.
 
 See [the design and delivery boundary](docs/logical-reference.md).
+See [the update/replacement design](docs/update-events.md) for capture policy,
+applied update descriptions, and transactional logical messages.
 The old native-WAL decoder remains an independent experiment, not the serving
 implementation. PostgreSQL 16/17/18 native fixtures are retained; the logical
 provider and real client integration are validated on PostgreSQL 17.
@@ -31,7 +34,7 @@ CONTAINER_RUNTIME=podman PG_MAJOR=17 \
 ```
 
 This runs the existing native collection fixtures, logical insert/delete
-regressions, authenticated client `watch()`/`getMore`, and retained-token replay
+and update/replacement regressions, authenticated client `watch()`/`getMore`, and retained-token replay
 after a primary restart. Use `CONTAINER_RUNTIME=docker` for Docker.
 The integration image preserves the packaged DocumentDB backend and gateway,
 installs the BSON runtime library, and updates PostgreSQL within its major to
@@ -111,7 +114,7 @@ Memory exhaustion is an explicit error, not a partial successful batch.
 
 The logical reference does not use this diagnostic or inherit its token format.
 Production readiness still requires automatic retention/lifecycle management,
-accurate update tracking, authenticated tokens and migration policy, additional
+positional update support, authenticated tokens and migration policy, additional
 failure/resource tests, and broader backend/gateway compatibility. The bundled
 replica-identity patch is a deferred storage-policy experiment, not a prerequisite
-for this insert/delete milestone.
+for the logical reference.

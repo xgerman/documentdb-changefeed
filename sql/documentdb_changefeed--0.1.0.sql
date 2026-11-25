@@ -18,15 +18,22 @@ CREATE TABLE documentdb_changefeed.feeds (
     storage_id oid NOT NULL,
     generation text NOT NULL,
     start_lsn pg_lsn NOT NULL,
+    capture_updates boolean NOT NULL DEFAULT false,
     PRIMARY KEY (database_name, collection_name)
 );
 REVOKE ALL ON TABLE documentdb_changefeed.feeds FROM PUBLIC;
 
-CREATE FUNCTION documentdb_changefeed.register_feed(text, text, text)
+CREATE FUNCTION documentdb_changefeed.register_feed(text, text, text, boolean DEFAULT false)
 RETURNS void
 AS 'MODULE_PATHNAME', 'documentdb_changefeed_register'
 LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
-REVOKE ALL ON FUNCTION documentdb_changefeed.register_feed(text, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION documentdb_changefeed.register_feed(text, text, text, boolean) FROM PUBLIC;
+
+CREATE FUNCTION documentdb_changefeed.capture_update()
+RETURNS trigger
+AS 'MODULE_PATHNAME', 'documentdb_changefeed_capture_update'
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
+REVOKE ALL ON FUNCTION documentdb_changefeed.capture_update() FROM PUBLIC;
 
 CREATE FUNCTION documentdb_changefeed.unregister_feed(text, text)
 RETURNS void

@@ -37,13 +37,16 @@ _PG_init(void)
 		if (*AvailabilityHook != NULL && *AvailabilityHook != Available)
 			ereport(ERROR,
 					(errmsg("a change stream provider is already registered")));
-		*AvailabilityHook = Available;
 	}
+	InitializeUpdateCapture();
+	if (AvailabilityHook != NULL)
+		*AvailabilityHook = Available;
 }
 
 void
 _PG_fini(void)
 {
+	FinalizeUpdateCapture();
 	if (AvailabilityHook != NULL && *AvailabilityHook == Available)
 		*AvailabilityHook = NULL;
 }

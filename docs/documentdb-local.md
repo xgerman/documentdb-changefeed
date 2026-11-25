@@ -1,6 +1,6 @@
 # Run the logical reference in DocumentDB Local
 
-Use a disposable environment. This is an insert/delete `watch()` proof, not a
+Use a disposable environment. This is an insert/delete and opt-in update `watch()` proof, not a
 production changefeed. It uses the packaged DocumentDB backend and gateway,
 without the bundled core patch or FULL replica identity.
 
@@ -20,7 +20,8 @@ no host ports and removes only its own container.
 
 It verifies the original native collection fixtures, the logical serving UDF,
 authenticated client `watch()`/`getMore`, independent readers, filtering,
-exclusive resume, and replay after restarting the same primary.
+exclusive resume, operator updates, replacements, no-ops, and replay after
+restarting the same primary.
 
 The test image installs the BSON runtime library and updates PostgreSQL within
 major 17 to match the current build headers. It does not rebuild or replace the
@@ -105,6 +106,28 @@ client object is constructed. Save an event's `_id` or the cursor's
 post-batch resume token and pass it as `resumeAfter` to replay exclusively after
 that position, while the same registered history survives.
 
+## Opt into update capture
+
+For a new feed that includes updates, replace the three-argument registration
+above with:
+
+```sql
+SELECT documentdb_api.coll_mod(
+    'cf_demo', 'events', '{"collMod":"events","enableUpdateDescription":true}');
+SELECT documentdb_changefeed.register_feed('cf_demo', 'events', 'cf_demo', true);
+```
+
+The library must be preloaded after DocumentDB in every writing backend.
+Registration installs a generation-specific AFTER UPDATE trigger. Operator
+events contain applied `updateDescription`; replacements and pipelines contain
+the exact replacement `fullDocument`. No-op operator updates emit nothing.
+Disabling the serving GUC does not stop capture for registered feeds.
+Unregister an existing feed before changing its capture policy; that ends its
+generation and invalidates its old tokens.
+
+Use a fresh installation for this unreleased reference schema. In-place
+upgrades from earlier experimental installations are not supported.
+
 ## Close the feed
 
 Unregistering detaches metadata but deliberately does not drop an
@@ -120,9 +143,9 @@ Reads reject a retained scan above 256 MiB; decoding rejects output above
 64 MiB and serving respects event/page bounds. `max_slot_wal_keep_size` is a
 checkpoint-enforced limit, not an instantaneous disk cap.
 
-Updates, replacements, truncation, pre-images, timestamp starts, distributed
+Unregistered updates, positional mutations, truncation, pre-images, timestamp starts, distributed
 collections, archive access, and durable failover are not supported by this
 milestone. Tokens are opaque and scope-checked, not authenticated production
 credentials. Lost, externally advanced, or replaced slot history fails rather
 than reset to now. See [the design](logical-reference.md) for the remaining
-production gates.
+production gates and [the update design](update-events.md) for capture limits.
