@@ -10,5 +10,9 @@
 
 extern PGDLLEXPORT Datum documentdb_changefeed_version(PG_FUNCTION_ARGS);
 extern PGDLLEXPORT Datum documentdb_changefeed_decode_test(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum documentdb_changefeed_register(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum documentdb_changefeed_unregister(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum documentdb_changefeed_aggregate(PG_FUNCTION_ARGS);
+extern bool ChangefeedEnabled;
 
 #endif

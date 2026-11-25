@@ -1,21 +1,41 @@
 # DocumentDB Changefeed
 
-Experimental PostgreSQL extension foundation for a retained-WAL DocumentDB
-changefeed. PostgreSQL 16, 17, and 18 are supported build targets, with a separate
-binary for each major. This is **not a usable production changefeed** yet.
+An experimental, separately installable collection `watch()` provider using
+PostgreSQL logical decoding and DocumentDB's existing aggregation/cursor UDF.
+The first reference supports **inserts and deletes with default replica
+identity**, per-event resume, independent readers, and filtered batches.
+It does not require the companion core patch or hook chaining.
 
-The PGXS package declares dependencies on `documentdb_core` and `documentdb`.
-Its installation SQL currently exposes only a restricted `version()` function.
-There is no capture policy, managed retention, continuation token, public feed,
-or MongoDB change-stream provider yet.
+**Not production-ready.** Updates, replacements, pre-images, timestamp starts,
+distribution, archives, and durable failover are unsupported. Slots are
+administrator-owned and retained history is not advanced automatically.
+Unsupported mutations fail explicitly rather than disappear.
+
+See [the design and delivery boundary](docs/logical-reference.md).
+The old native-WAL decoder remains an independent experiment, not the serving
+implementation. PostgreSQL 16/17/18 native fixtures are retained; the logical
+provider and real client integration are validated on PostgreSQL 17.
 
 ## Install into DocumentDB Local
 
-See [the container installation guide](docs/documentdb-local.md) for installing
-the module into a normal DocumentDB Local image, building the companion core
-patch, enabling logical WAL, and checking SQL installation and MongoDB access.
-The `local` Dockerfile target preserves the upstream gateway entrypoint; the
-default target is only for SQL fixtures.
+See [the container installation guide](docs/documentdb-local.md). The extension
+uses a default-off GUC and must be preloaded after DocumentDB in each serving
+backend. Installation alone does not enable `watch()`.
+
+Run the complete reference proof in a disposable container, with no host ports:
+
+```sh
+CONTAINER_RUNTIME=podman PG_MAJOR=17 \
+  DOCUMENTDB_IMAGE=ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0 \
+  CHANGEFEED_LOGICAL_TEST=1 bash scripts/test-container.sh
+```
+
+This runs the existing native collection fixtures, logical insert/delete
+regressions, authenticated client `watch()`/`getMore`, and retained-token replay
+after a primary restart. Use `CONTAINER_RUNTIME=docker` for Docker.
+The integration image preserves the packaged DocumentDB backend and gateway,
+installs the BSON runtime library, and updates PostgreSQL within its major to
+match the current development headers.
 
 ## Decoder feasibility fixtures
 
@@ -48,7 +68,7 @@ DocumentDB collection integration on PG16 and PG18 remains unverified.
 
 Both suites explicitly install a private diagnostic C function; it is not
 included in the extension's installation SQL. No dependency extensions are
-faked. This is not MongoDB driver or gateway `watch()` coverage.
+faked. These native-decoder suites are separate from the logical `watch()` proof.
 
 Run dependencies only in containers:
 
@@ -89,7 +109,9 @@ inserts and truncation are rejected. Incomplete transactions at the supplied end
 are omitted; scanning the original range again after commit includes them.
 Memory exhaustion is an explicit error, not a partial successful batch.
 
-Production APIs remain gated on lifecycle/retention correctness, validated
-DocumentDB provider hooks and replica-identity ownership, safe starts and
-authenticated resumability, recovery/fault tests, and real-driver integration.
-Do not enable change streams or depend on this diagnostic in a deployment.
+The logical reference does not use this diagnostic or inherit its token format.
+Production readiness still requires automatic retention/lifecycle management,
+accurate update tracking, authenticated tokens and migration policy, additional
+failure/resource tests, and broader backend/gateway compatibility. The bundled
+replica-identity patch is a deferred storage-policy experiment, not a prerequisite
+for this insert/delete milestone.
