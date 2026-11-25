@@ -14,5 +14,9 @@ extern PGDLLEXPORT Datum documentdb_changefeed_register(PG_FUNCTION_ARGS);
 extern PGDLLEXPORT Datum documentdb_changefeed_unregister(PG_FUNCTION_ARGS);
 extern PGDLLEXPORT Datum documentdb_changefeed_aggregate(PG_FUNCTION_ARGS);
 extern bool ChangefeedEnabled;
+extern PGDLLEXPORT Datum documentdb_changefeed_capture_update(PG_FUNCTION_ARGS);
+void InitializeUpdateCapture(void);
+void FinalizeUpdateCapture(void);
+bool UpdateCaptureAvailable(void);
 
 #endif

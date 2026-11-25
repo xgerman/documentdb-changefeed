@@ -109,6 +109,7 @@ documentdb_changefeed_register(PG_FUNCTION_ARGS)
 	XLogRecPtr start;
 	bool isNull;
 	Datum shard;
+	bool captureUpdates = PG_GETARG_BOOL(3);
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -116,10 +117,13 @@ documentdb_changefeed_register(PG_FUNCTION_ARGS)
 	ValidateNamespace(database);
 	ValidateNamespace(collection);
 	ValidateNamespace(slot);
+	if (captureUpdates && !UpdateCaptureAvailable())
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					   errmsg("update capture requires preloading after DocumentDB")));
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 	CheckRetention();
-	Execute("SELECT ('documentdb_data.documents_' || collection_id)::regclass::oid, shard_key"
+	Execute("SELECT ('documentdb_data.documents_' || collection_id)::regclass::oid, shard_key,options"
 			" FROM documentdb_api_catalog.collections"
 			" WHERE database_name=$1 AND collection_name=$2 AND view_definition IS NULL",
 			2, types, values, true);
@@ -131,6 +135,22 @@ documentdb_changefeed_register(PG_FUNCTION_ARGS)
 	if (!isNull)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					   errmsg("the reference changefeed does not support sharded collections")));
+	if (captureUpdates)
+	{
+		bson_t options;
+		bson_iter_t setting;
+		Datum value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isNull);
+		bool enabled = false;
+		if (!isNull)
+		{
+			InitBson(value, &options);
+			enabled = bson_iter_init_find(&setting, &options, "enableUpdateDescription") &&
+				BSON_ITER_HOLDS_BOOL(&setting) && bson_iter_bool(&setting);
+		}
+		if (!enabled)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("update capture requires enableUpdateDescription on the collection")));
+	}
 	Execute("SELECT confirmed_flush_lsn FROM pg_replication_slots"
 			" WHERE slot_name=$1 AND database=current_database()"
 			" AND plugin='pg_documentdb_changefeed' AND NOT active AND NOT two_phase"
@@ -145,14 +165,25 @@ documentdb_changefeed_register(PG_FUNCTION_ARGS)
 		snprintf(hex + index * 2, 3, "%02x", random[index]);
 	generation = pstrdup(hex);
 	{
-		Oid insertTypes[] = {TEXTOID, TEXTOID, TEXTOID, OIDOID, TEXTOID, LSNOID};
+		Oid insertTypes[] = {TEXTOID, TEXTOID, TEXTOID, OIDOID, TEXTOID, LSNOID, BOOLOID};
 		Datum insertValues[] = {values[0], values[1], values[2],
 							   ObjectIdGetDatum(relation),
-							   CStringGetTextDatum(generation), LSNGetDatum(start)};
+							   CStringGetTextDatum(generation), LSNGetDatum(start),
+							   BoolGetDatum(captureUpdates)};
 		Execute("INSERT INTO documentdb_changefeed.feeds"
-				" (database_name, collection_name, slot, relation_id, generation, start_lsn, storage_id)"
-				" VALUES ($1,$2,$3,$4,$5,$6,pg_relation_filenode($4))",
-				6, insertTypes, insertValues, false);
+				" (database_name, collection_name, slot, relation_id, generation, start_lsn, storage_id,capture_updates)"
+				" VALUES ($1,$2,$3,$4,$5,$6,pg_relation_filenode($4),$7)",
+				7, insertTypes, insertValues, false);
+	}
+	if (captureUpdates)
+	{
+		char *table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(relation)),
+												get_rel_name(relation));
+		char *name = psprintf("cf_update_%.16s", generation);
+		Execute(psprintf("CREATE TRIGGER %s AFTER UPDATE ON %s"
+						 " FOR EACH ROW EXECUTE FUNCTION documentdb_changefeed.capture_update(%s)",
+						 quote_identifier(name), table, quote_literal_cstr(generation)),
+				0, NULL, NULL, false);
 	}
 	SPI_finish();
 	PG_RETURN_VOID();
@@ -168,6 +199,21 @@ documentdb_changefeed_unregister(PG_FUNCTION_ARGS)
 					   errmsg("changefeed registration requires superuser")));
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
+	Execute("SELECT relation_id,generation,capture_updates FROM documentdb_changefeed.feeds"
+			" WHERE database_name=$1 AND collection_name=$2", 2, types, values, true);
+	if (SPI_processed == 1 && DatumGetBool(Column(3)))
+	{
+		Oid relation = DatumGetObjectId(Column(1));
+		char *generation = TextDatumGetCString(Column(2));
+		if (get_rel_name(relation) != NULL)
+		{
+			char *table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(relation)),
+													get_rel_name(relation));
+			Execute(psprintf("DROP TRIGGER IF EXISTS %s ON %s",
+							 quote_identifier(psprintf("cf_update_%.16s", generation)), table),
+					0, NULL, NULL, false);
+		}
+	}
 	Execute("DELETE FROM documentdb_changefeed.feeds"
 			" WHERE database_name=$1 AND collection_name=$2",
 			2, types, values, false);
@@ -432,15 +478,16 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 	}
 	if (resume != NULL && batchCount > 0)
 	{
-		Oid readTypes[] = {TEXTOID, LSNOID, TEXTOID, TEXTOID};
+		Oid readTypes[] = {TEXTOID, LSNOID, TEXTOID, TEXTOID, TEXTOID};
 		Datum readArgs[] = {CStringGetTextDatum(feed.slot), LSNGetDatum(horizon),
 						   CStringGetTextDatum(psprintf("%u", feed.relation)),
-						   CStringGetTextDatum(psprintf("%X/%X", LSN_FORMAT_ARGS(position)))};
+						   CStringGetTextDatum(psprintf("%X/%X", LSN_FORMAT_ARGS(position))),
+						   CStringGetTextDatum(feed.generation)};
 		XLogRecPtr previousPosition = position;
 		int64 previousOrdinal = ordinal;
 		Execute("SELECT data FROM pg_logical_slot_peek_binary_changes"
-				" ($1,$2,NULL,'relation',$3,'after',$4)",
-				4, readTypes, readArgs, true);
+				" ($1,$2,NULL,'relation',$3,'after',$4,'generation',$5)",
+				5, readTypes, readArgs, true);
 		for (uint64 index = 0; index < SPI_processed; index++)
 		{
 			bool isNull;

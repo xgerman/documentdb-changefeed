@@ -52,11 +52,48 @@ async function main() {
     check.equal(await filtered.tryNext(), null);
     await collection.deleteOne({ _id: "filtered" });
     check.equal((await nextEvent(filtered)).documentKey._id, "filtered");
+
+    const updates = db.getSiblingDB("cf_watch_updates").events;
+    await updates.insertOne({ _id: "tracked", counter: 0, remove: true, items: [1, 2] });
+    const updateStream = await updates.watch([], { batchSize: 1, maxAwaitTimeMS: 50 });
+    check.equal(await updateStream.tryNext(), null);
+    await updates.updateOne(
+        { _id: "tracked" },
+        { $inc: { counter: 2 }, $set: { "nested.value": 3 }, $unset: { remove: "" } }
+    );
+    const changed = await nextEvent(updateStream);
+    check.equal(changed.operationType, "update");
+    check.equal(changed.documentKey._id, "tracked");
+    check.equal(changed.updateDescription.updatedFields.counter, 2);
+    check.equal(changed.updateDescription.updatedFields["nested.value"], 3);
+    check.equal(EJSON.stringify(changed.updateDescription.removedFields), '["remove"]');
+    check.equal(changed.fullDocument, undefined);
+    await updates.replaceOne({ _id: "tracked" }, { _id: "tracked", payload: "replacement" });
+    const replaced = await nextEvent(updateStream);
+    check.equal(replaced.operationType, "replace");
+    check.equal(replaced.fullDocument.payload, "replacement");
+    check.equal(replaced.updateDescription, undefined);
+    const updateResume = await updates.watch(
+        [], { resumeAfter: changed._id, batchSize: 1, maxAwaitTimeMS: 50 }
+    );
+    check.equal(EJSON.stringify(await nextEvent(updateResume)), EJSON.stringify(replaced));
+    await updates.updateOne({ _id: "tracked" }, [{ $set: { pipeline: true } }]);
+    const pipeline = await nextEvent(updateStream);
+    check.equal(pipeline.operationType, "replace");
+    check.equal(pipeline.fullDocument.pipeline, true);
+    await updates.updateMany({ _id: "tracked" }, { $set: { pipeline: true } });
+    check.equal(await updateStream.tryNext(), null);
+    await updates.findOneAndUpdate({ _id: "tracked" }, { $set: { modified: true } });
+    const modified = await nextEvent(updateStream);
+    check.equal(modified.operationType, "update");
+    check.equal(modified.updateDescription.updatedFields.modified, true);
+    await updateStream.close();
+    await updateResume.close();
     await first.close();
     await second.close();
     await resumed.close();
     await filtered.close();
-    print("PASS client watch/getMore: inserts, deletes, independent readers, exclusive resume and filtering");
+    print("PASS client watch/getMore: inserts, deletes, updates, replacements/pipelines, no-ops, independent readers, exclusive resume and filtering");
 }
 
 main();

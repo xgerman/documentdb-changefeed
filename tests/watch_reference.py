@@ -19,6 +19,11 @@ def main():
           " '{\"delete\":\"events\",\"deletes\":[{\"q\":{},\"limit\":0}]}')")
     query(connection, "SELECT pg_create_logical_replication_slot('cf_watch','pg_documentdb_changefeed')")
     query(connection, "SELECT documentdb_changefeed.register_feed('cf_watch','events','cf_watch')")
+    query(connection, "SELECT documentdb_api.create_collection('cf_watch_updates','events')")
+    query(connection, "SELECT documentdb_api.coll_mod('cf_watch_updates','events',"
+          " '{\"collMod\":\"events\",\"enableUpdateDescription\":true}')")
+    query(connection, "SELECT pg_create_logical_replication_slot('cf_watch_updates','pg_documentdb_changefeed')")
+    query(connection, "SELECT documentdb_changefeed.register_feed('cf_watch_updates','events','cf_watch_updates',true)")
     query(connection, "SELECT documentdb_api.create_user(%s::documentdb_core.bson)",
           (json.dumps({"createUser": "cf_client", "pwd": password, "roles": [
               {"role": "readWriteAnyDatabase", "db": "admin"},
@@ -62,6 +67,8 @@ def main():
             path.unlink()
             query(connection, "SELECT documentdb_changefeed.unregister_feed('cf_watch','events')")
             query(connection, "SELECT pg_drop_replication_slot('cf_watch')")
+            query(connection, "SELECT documentdb_changefeed.unregister_feed('cf_watch_updates','events')")
+            query(connection, "SELECT pg_drop_replication_slot('cf_watch_updates')")
             connection.close()
 
 

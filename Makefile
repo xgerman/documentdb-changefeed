@@ -1,10 +1,13 @@
 EXTENSION = documentdb_changefeed
 MODULE_big = pg_documentdb_changefeed
-OBJS = src/extension.o src/wal_decoder.o src/logical_output.o src/logical_provider.o
+OBJS = src/extension.o src/wal_decoder.o src/logical_output.o src/logical_provider.o src/update_capture.o
 DATA = sql/documentdb_changefeed--0.1.0.sql
 PGFILEDESC = "documentdb_changefeed - experimental logical changefeed provider"
 
-PG_CPPFLAGS = -I$(srcdir)/include $(shell pkg-config --cflags libbson-1.0)
+DOCUMENTDB_SOURCE ?= /opt/documentdb-source
+PG_CPPFLAGS = -I$(srcdir)/include $(shell pkg-config --cflags libbson-1.0) \
+	-I$(DOCUMENTDB_SOURCE)/pg_documentdb_core/include \
+	-I$(DOCUMENTDB_SOURCE)/pg_documentdb/include
 SHLIB_LINK = $(shell pkg-config --libs libbson-1.0) -ldl
 PG_CFLAGS = -std=gnu99 -Wall -Wextra -Werror -Wno-unused-parameter \
 	-Wno-declaration-after-statement

@@ -7,11 +7,13 @@ using PostgreSQL logical decoding and the existing DocumentDB aggregation UDF.
 Do not require a new core hook or the bundled FULL-identity patch.
 
 The first milestone supports inserts and deletes, including typed keys and
-large inserted BSON documents. Updates, replacements, pre-images, timestamp
+large inserted BSON documents. Its opt-in [update/replacement extension](update-events.md)
+uses the existing public tracker and a transactional logical-message adapter.
+Pre-images, timestamp
 starts, distribution, archive access, and durable failover are explicitly
 unsupported. Unsupported mutations must fail rather than disappear or be
-mislabelled. Accurate updates require implementing the existing update-tracker
-contract; a document diff is not a substitute.
+mislabelled. Updates require explicit capture registration; a document diff is
+not a substitute for the existing update-tracker contract.
 
 The native-WAL decoder remains an independent feasibility experiment. Its
 fixtures and private diagnostic are not the serving implementation.
@@ -102,5 +104,5 @@ include this library where that setting exists.
 5. Unauthorized reads, cross-collection tokens, disabled-provider behavior,
    unregister/slot cleanup, and unchanged ordinary collection operations.
 
-Update-description support and automatic retention are subsequent milestones,
-not implied by this proof of the existing provider seam.
+Update-description support is a dependent milestone described separately.
+Automatic retention remains future work, not implied by this provider proof.

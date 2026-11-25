@@ -75,6 +75,7 @@ fi
 "$runtime" exec --user "$user" "$name" /usr/bin/python3 "$test"
 if [ "$logical" == 1 ]; then
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/logical_reference.py
+    "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/update_reference.py
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/watch_reference.py
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/restart_reference.py prepare
     "$runtime" restart "$name" >/dev/null
