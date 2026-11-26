@@ -74,9 +74,11 @@ if [ "$ready" != true ]; then
 fi
 "$runtime" exec --user "$user" "$name" /usr/bin/python3 "$test"
 if [ "$logical" == 1 ]; then
+    "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/upgrade_reference.py
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/logical_reference.py
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/update_reference.py
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/watch_reference.py
+    "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/demand_reference.py
     "$runtime" exec --user "$user" "$name" /usr/bin/python3 tests/restart_reference.py prepare
     "$runtime" restart "$name" >/dev/null
     for ((attempt=0; attempt<60; attempt++)); do

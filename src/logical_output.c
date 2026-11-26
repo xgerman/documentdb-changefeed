@@ -80,9 +80,9 @@ Startup(LogicalDecodingContext *context, OutputPluginOptions *options,
 		else
 			ereport(ERROR, (errmsg("unknown changefeed decoding option")));
 	}
-	if (!isInit && !OidIsValid(state->relation))
+	if (!isInit && !context->fast_forward && !OidIsValid(state->relation))
 		ereport(ERROR, (errmsg("changefeed decoding requires a relation")));
-	if (!isInit)
+	if (!isInit && !context->fast_forward)
 		state->bsonType = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
 										CStringGetDatum("bson"),
 										ObjectIdGetDatum(get_namespace_oid("documentdb_core", false)));
@@ -243,6 +243,9 @@ Commit(LogicalDecodingContext *context, ReorderBufferTXN *transaction,
 				continue;
 			bson_init_static(&stored, pending->data, pending->length);
 			event = bson_copy(&stored);
+			BSON_APPEND_DATE_TIME(event, "wallTime",
+								  transaction->xact_time.commit_time / 1000 +
+								  (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * INT64CONST(86400000));
 			if (pending->update)
 			{
 				bson_t metadata;

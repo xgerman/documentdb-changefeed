@@ -17,13 +17,7 @@ def main():
     query(connection, "SELECT documentdb_api.create_collection('cf_watch','events')")
     query(connection, "SELECT documentdb_api.delete('cf_watch',"
           " '{\"delete\":\"events\",\"deletes\":[{\"q\":{},\"limit\":0}]}')")
-    query(connection, "SELECT pg_create_logical_replication_slot('cf_watch','pg_documentdb_changefeed')")
-    query(connection, "SELECT documentdb_changefeed.register_feed('cf_watch','events','cf_watch')")
     query(connection, "SELECT documentdb_api.create_collection('cf_watch_updates','events')")
-    query(connection, "SELECT documentdb_api.coll_mod('cf_watch_updates','events',"
-          " '{\"collMod\":\"events\",\"enableUpdateDescription\":true}')")
-    query(connection, "SELECT pg_create_logical_replication_slot('cf_watch_updates','pg_documentdb_changefeed')")
-    query(connection, "SELECT documentdb_changefeed.register_feed('cf_watch_updates','events','cf_watch_updates',true)")
     query(connection, "SELECT documentdb_api.create_user(%s::documentdb_core.bson)",
           (json.dumps({"createUser": "cf_client", "pwd": password, "roles": [
               {"role": "readWriteAnyDatabase", "db": "admin"},
@@ -57,6 +51,43 @@ def main():
                  "--tls", "--tlsAllowInvalidCertificates", "--file", "tests/watch.js"],
                 env={**os.environ, "CF_TEST_PASSWORD": password}, check=True, timeout=120,
             )
+            functional_tests = os.environ.get("CHANGEFEED_FUNCTIONAL_TESTS")
+            if functional_tests:
+                for database in ("cf_watch", "cf_watch_updates"):
+                    query(connection, "SELECT documentdb_changefeed.unregister_feed(%s,'events')", (database,))
+                uri = (f"mongodb://cf_client:{password}@localhost:10260/"
+                       "?tls=true&tlsAllowInvalidCertificates=true&authSource=admin&directConnection=true")
+                from pymongo import MongoClient
+
+                client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+                try:
+                    for command in ("hello", "whatsmyuri"):
+                        try:
+                            reply = client.admin.command(command)
+                            if command == "whatsmyuri" and not isinstance(reply.get("you"), str):
+                                raise RuntimeError("response is missing the required string field 'you'")
+                        except Exception as error:
+                            raise RuntimeError(
+                                f"Public suite capability probe {command} failed: "
+                                + str(error).replace(password, "<redacted>")
+                            ) from None
+                finally:
+                    client.close()
+                tests = [
+                    f"documentdb_tests/compatibility/tests/changeStreams/{operation}/"
+                    f"test_smoke_changeStream_{operation}.py"
+                    for operation in ("insert", "update", "replace", "delete")
+                ]
+                result = subprocess.run(
+                    ["pytest", *tests, "-q", "--tb=short",
+                     "-o", "cache_dir=/tmp/cf-functional-pytest-cache",
+                     "--engine-name", "documentdb", "--connection-string", uri],
+                    cwd=functional_tests, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=180,
+                )
+                print(result.stdout.replace(password, "<redacted>"), flush=True)
+                if result.returncode:
+                    raise RuntimeError(f"Public change-stream smoke tests exited {result.returncode}")
         finally:
             gateway.terminate()
             try:
@@ -66,9 +97,7 @@ def main():
                 gateway.wait()
             path.unlink()
             query(connection, "SELECT documentdb_changefeed.unregister_feed('cf_watch','events')")
-            query(connection, "SELECT pg_drop_replication_slot('cf_watch')")
             query(connection, "SELECT documentdb_changefeed.unregister_feed('cf_watch_updates','events')")
-            query(connection, "SELECT pg_drop_replication_slot('cf_watch_updates')")
             connection.close()
 
 

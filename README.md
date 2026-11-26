@@ -3,18 +3,21 @@
 An experimental, separately installable collection `watch()` provider using
 PostgreSQL logical decoding and DocumentDB's existing aggregation/cursor UDF.
 The reference supports **inserts and deletes with default replica identity**,
-plus opt-in operator updates and replacements, per-event resume, independent
+plus operator updates and replacements, per-event resume, independent
 readers, and filtered batches.
 It does not require the companion core patch or hook chaining.
 
 **Not production-ready.** Positional updates, pre-images, timestamp starts,
-distribution, archives, and durable failover are unsupported. Slots are
-administrator-owned and retained history is not advanced automatically.
+distribution, absent-namespace watches, archives, and durable failover are
+unsupported. Ordinary `watch()` activates capture only on the requested existing
+collection, with an owned slot and automatic bounded retention.
 Unsupported mutations fail explicitly rather than disappear.
 
 See [the design and delivery boundary](docs/logical-reference.md).
 See [the update/replacement design](docs/update-events.md) for capture policy,
 applied update descriptions, and transactional logical messages.
+See [demand activation and retention](docs/demand-capture.md) for lifecycle,
+ownership, migration, and explicit feature gaps.
 The old native-WAL decoder remains an independent experiment, not the serving
 implementation. PostgreSQL 16/17/18 native fixtures are retained; the logical
 provider and real client integration are validated on PostgreSQL 17.
@@ -22,8 +25,13 @@ provider and real client integration are validated on PostgreSQL 17.
 ## Install into DocumentDB Local
 
 See [the container installation guide](docs/documentdb-local.md). The extension
-uses a default-off GUC and must be preloaded after DocumentDB in each serving
-backend. Installation alone does not enable `watch()`.
+must be preloaded after DocumentDB in each serving backend. With the required
+server settings in place, installation makes `watch()` available without feed
+registration. No collection is captured until requested.
+
+`documentdb_changefeed.resume_retention` defaults to `24h` and can be shortened
+through server configuration and reload. It bounds history age and the idle
+capture grace period. Resource limits can expire history sooner.
 
 Run the complete reference proof in a disposable container, with no host ports:
 
@@ -34,8 +42,10 @@ CONTAINER_RUNTIME=podman PG_MAJOR=17 \
 ```
 
 This runs the existing native collection fixtures, logical insert/delete
-and update/replacement regressions, authenticated client `watch()`/`getMore`, and retained-token replay
-after a primary restart. Use `CONTAINER_RUNTIME=docker` for Docker.
+and update/replacement regressions, schema upgrade, authenticated client
+`watch()`/`getMore` without registration, demand/expiry/cleanup regressions,
+and retained-token replay after a primary restart.
+Use `CONTAINER_RUNTIME=docker` for Docker.
 The integration image preserves the packaged DocumentDB backend and gateway,
 installs the BSON runtime library, and updates PostgreSQL within its major to
 match the current development headers.
@@ -113,7 +123,7 @@ are omitted; scanning the original range again after commit includes them.
 Memory exhaustion is an explicit error, not a partial successful batch.
 
 The logical reference does not use this diagnostic or inherit its token format.
-Production readiness still requires automatic retention/lifecycle management,
+Production readiness still requires broader lifecycle coverage,
 positional update support, authenticated tokens and migration policy, additional
 failure/resource tests, and broader backend/gateway compatibility. The bundled
 replica-identity patch is a deferred storage-policy experiment, not a prerequisite

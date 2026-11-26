@@ -65,7 +65,14 @@ def main():
     assert int(query(connection, "SHOW server_version_num")[0][0]) // 10000 == int(os.environ["PG_MAJOR"])
     query(connection, "CREATE EXTENSION documentdb CASCADE")
     query(connection, "CREATE EXTENSION documentdb_changefeed")
-    assert query(connection, "SELECT documentdb_changefeed.version()")[0][0] == "0.1.0-dev"
+    assert query(connection, "SELECT documentdb_changefeed.version()")[0][0] == "0.2.0-dev"
+    if os.environ.get("CHANGEFEED_LOGICAL_TEST") != "1":
+        query(connection, "SET documentdb_changefeed.enable=on")
+        expect_error("55000", lambda: query(
+            connection, "SELECT * FROM documentdb_api_internal.change_stream_aggregation"
+            " ('unconfigured','events','{}','{}')",
+        ))
+        query(connection, "RESET documentdb_changefeed.enable")
     install_decoder(connection)
     query(connection, "SELECT documentdb_api.create_collection(%s, %s)", (DATABASE, COLLECTION))
     collection_id = query(

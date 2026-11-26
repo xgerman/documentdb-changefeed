@@ -1,6 +1,6 @@
 # Run the logical reference in DocumentDB Local
 
-Use a disposable environment. This is an insert/delete and opt-in update `watch()` proof, not a
+Use a disposable environment. This is a demand-driven collection `watch()` proof, not a
 production changefeed. It uses the packaged DocumentDB backend and gateway,
 without the bundled core patch or FULL replica identity.
 
@@ -21,7 +21,8 @@ no host ports and removes only its own container.
 It verifies the original native collection fixtures, the logical serving UDF,
 authenticated client `watch()`/`getMore`, independent readers, filtering,
 exclusive resume, operator updates, replacements, no-ops, and replay after
-restarting the same primary.
+restarting the same primary. Client fixtures do not register feeds or create
+slots. Separate regressions cover retention, cleanup, and schema upgrade.
 
 The test image installs the BSON runtime library and updates PostgreSQL within
 major 17 to match the current build headers. It does not rebuild or replace the
@@ -57,8 +58,10 @@ ALTER SYSTEM SET shared_preload_libraries =
 ALTER SYSTEM SET wal_level = logical;
 ALTER SYSTEM SET max_replication_slots = 4;
 ALTER SYSTEM SET max_slot_wal_keep_size = '1GB';
+ALTER SYSTEM SET max_worker_processes = 8;
 ALTER SYSTEM SET output_plugin_libraries = pgoutput, pg_documentdb_changefeed;
 ALTER SYSTEM SET documentdb_changefeed.enable = on;
+ALTER SYSTEM SET documentdb_changefeed.resume_retention = '24h';
 ```
 
 Preserve any additional existing preload libraries. The provider must come
@@ -69,24 +72,24 @@ administrators.
 
 Installation fails rather than overwrite an existing change-stream UDF.
 Preloading fails rather than chain or replace an existing availability hook.
-Installing the extension does not enable the default-off feature.
+The serving capability defaults to enabled after installation. Capture remains
+inactive until a collection is watched. The background launcher and one
+maintenance worker per database with retained demand require worker capacity.
 
-## Register one existing collection
+## Watch one existing collection
 
-Create the collection before the slot. Each SQL statement below must run in a
-separate autocommit transaction; slot creation cannot follow writes in the same
-transaction.
+Create the collection normally, through the client or the collection API.
+An absent-namespace watch is an explicit feature gap; it does not create a
+collection as a side effect.
 
 ```sql
 SELECT documentdb_api.create_collection('cf_demo', 'events');
-SELECT pg_create_logical_replication_slot('cf_demo', 'pg_documentdb_changefeed');
-SELECT documentdb_changefeed.register_feed('cf_demo', 'events', 'cf_demo');
 ```
 
-Registration attaches an existing slot, validates its plugin/database and the
-unsharded collection, and records a generation and relation identity. It does
-not create slots or alter replica identity. The serving function checks the
-invoking role's collection read permission on every call.
+The first executed watch automatically provisions an owned slot, update capture,
+and a generation. It does not alter replica identity. The serving function
+checks the invoking role's collection read permission before activation and on
+every read. No additional SQL registration is required.
 
 In an authenticated client connected to that gateway:
 
@@ -106,39 +109,57 @@ client object is constructed. Save an event's `_id` or the cursor's
 post-batch resume token and pass it as `resumeAfter` to replay exclusively after
 that position, while the same registered history survives.
 
-## Opt into update capture
+## Retention and cleanup
 
-For a new feed that includes updates, replace the three-argument registration
-above with:
+History and idle capture default to at most 24 hours. A shorter policy can be
+applied without a server restart:
 
 ```sql
-SELECT documentdb_api.coll_mod(
-    'cf_demo', 'events', '{"collMod":"events","enableUpdateDescription":true}');
-SELECT documentdb_changefeed.register_feed('cf_demo', 'events', 'cf_demo', true);
+ALTER SYSTEM SET documentdb_changefeed.resume_retention = '6h';
+SELECT pg_reload_conf();
 ```
 
 The library must be preloaded after DocumentDB in every writing backend.
-Registration installs a generation-specific AFTER UPDATE trigger. Operator
+Activation installs a generation-specific AFTER UPDATE trigger. Operator
 events contain applied `updateDescription`; replacements and pipelines contain
 the exact replacement `fullDocument`. No-op operator updates emit nothing.
 Disabling the serving GUC does not stop capture for registered feeds.
-Unregister an existing feed before changing its capture policy; that ends its
-generation and invalidates its old tokens.
+Successful polls renew demand. Closing a cursor does not immediately stop
+capture, because disconnected clients need retained resume history.
+Cleanup runs periodically, up to once per minute at the default retention.
 
-Use a fresh installation for this unreleased reference schema. In-place
-upgrades from earlier experimental installations are not supported.
+Upgrade an existing 0.1.0 schema to 0.2.0:
 
-## Close the feed
-
-Unregistering detaches metadata but deliberately does not drop an
-administrator's slot:
+Install the new library and SQL files, restart PostgreSQL and the gateway to
+load the new preloaded binary, then upgrade the schema before serving watches.
 
 ```sql
+ALTER EXTENSION documentdb_changefeed UPDATE;
+```
+
+An administrator can end demand immediately:
+
+```sql
+SELECT documentdb_changefeed.unregister_feed('cf_demo', 'events');
+```
+
+This removes owned capture and its slot. Unregister owned feeds before dropping
+the extension itself; SQL removal does not preserve their cleanup metadata.
+
+## Optional manual diagnostics
+
+The original manual API remains available. Statements must use separate
+autocommit transactions when creating logical slots:
+
+```sql
+SELECT pg_create_logical_replication_slot('cf_demo', 'pg_documentdb_changefeed');
+SELECT documentdb_changefeed.register_feed('cf_demo', 'events', 'cf_demo');
 SELECT documentdb_changefeed.unregister_feed('cf_demo', 'events');
 SELECT pg_drop_replication_slot('cf_demo');
 ```
 
-Do not leave unattended slots. Peeking does not advance retained history.
+Manual slots are never advanced or dropped automatically. Do not leave them
+unattended.
 Reads reject a retained scan above 256 MiB; decoding rejects output above
 64 MiB and serving respects event/page bounds. `max_slot_wal_keep_size` is a
 checkpoint-enforced limit, not an instantaneous disk cap.

@@ -5,7 +5,8 @@
 Build on the logical insert/delete reference using the existing public update
 tracker callbacks. Add accurate operator update descriptions and replacement
 events without a document-diff classifier, FULL replica identity, or a new core
-hook. Pre-images and automatic retention remain separate milestones.
+hook. Pre-images remain unsupported. Demand activation and bounded retention
+are described in [the next milestone](demand-capture.md).
 
 ## Why the tracker alone is insufficient
 
@@ -29,6 +30,10 @@ the source relation/CTID through the existing updater. Registration validates
 that setting and installs an extension-owned, generation-specific trigger.
 Unregister removes only that trigger. Neither operation changes replica identity
 or enables logical pre-images.
+
+Normal `watch()` now provisions this capture path on its requested existing
+collection automatically. It enables the update-description source only there,
+and removes owned capture after the configured idle grace period.
 
 Capture remains active for registered update feeds when serving is disabled,
 so disabling the read gate does not silently create a capture gap.
@@ -64,8 +69,8 @@ numeric field paths use the applied values reported by the updater.
 The supported write surface is the collection API. This reference is not an
 authenticated audit log for arbitrary SQL or administrator modifications.
 Internal metadata is bounded, private, and not a production token/format
-compatibility promise. The shared-slot retention and primary-only limits of
-the lower layer remain.
+compatibility promise. The primary-only limits of the lower layer remain. Each automatically demanded
+collection owns its own bounded slot; manual slots keep their original policy.
 
 ## Validation
 

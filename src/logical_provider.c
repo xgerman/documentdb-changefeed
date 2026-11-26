@@ -5,6 +5,7 @@
 
 #include <bson.h>
 #include "access/xlog.h"
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "common/base64.h"
 #include "executor/spi.h"
@@ -13,7 +14,9 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/inval.h"
 #include "utils/pg_lsn.h"
+#include "utils/timestamp.h"
 
 #include "changefeed.h"
 
@@ -33,6 +36,8 @@ typedef struct Feed
 	char *slot;
 	char *generation;
 	XLogRecPtr start;
+	bool owned;
+	TimestampTz lastActivity;
 } Feed;
 
 static void
@@ -199,13 +204,35 @@ documentdb_changefeed_unregister(PG_FUNCTION_ARGS)
 					   errmsg("changefeed registration requires superuser")));
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
-	Execute("SELECT relation_id,generation,capture_updates FROM documentdb_changefeed.feeds"
-			" WHERE database_name=$1 AND collection_name=$2", 2, types, values, true);
-	if (SPI_processed == 1 && DatumGetBool(Column(3)))
+	Execute("SELECT f.relation_id,f.generation,f.capture_updates,f.auto_owned,f.slot,"
+			" f.restore_update_description AND COALESCE(f.relation_id="
+			" to_regclass('documentdb_data.documents_' || c.collection_id)::oid"
+			" AND f.storage_id=pg_relation_filenode(f.relation_id),false)"
+			" FROM documentdb_changefeed.feeds f LEFT JOIN documentdb_api_catalog.collections c"
+			" ON c.database_name=f.database_name AND c.collection_name=f.collection_name"
+			" WHERE f.database_name=$1 AND f.collection_name=$2", 2, types, values, true);
+	if (SPI_processed == 1)
 	{
 		Oid relation = DatumGetObjectId(Column(1));
 		char *generation = TextDatumGetCString(Column(2));
-		if (get_rel_name(relation) != NULL)
+		bool capture = DatumGetBool(Column(3));
+		bool owned = DatumGetBool(Column(4));
+		char *slot = TextDatumGetCString(Column(5));
+		bool restore = DatumGetBool(Column(6));
+		Oid lockType = INT8OID;
+		Datum lockKey = Int64GetDatum(((uint64) 0x43463101 << 32) | relation);
+		Execute("SELECT pg_advisory_xact_lock($1)", 1, &lockType, &lockKey, true);
+		if (owned)
+		{
+			Oid slotType = TEXTOID;
+			Datum slotValue = CStringGetTextDatum(slot);
+			Execute("SELECT 1 FROM pg_replication_slots WHERE slot_name=$1"
+					" AND database=current_database() AND plugin='pg_documentdb_changefeed'",
+					1, &slotType, &slotValue, true);
+			if (SPI_processed == 1)
+				Execute("SELECT pg_drop_replication_slot($1)", 1, &slotType, &slotValue, false);
+		}
+		if (capture && get_rel_name(relation) != NULL)
 		{
 			char *table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(relation)),
 													get_rel_name(relation));
@@ -213,6 +240,10 @@ documentdb_changefeed_unregister(PG_FUNCTION_ARGS)
 							 quote_identifier(psprintf("cf_update_%.16s", generation)), table),
 					0, NULL, NULL, false);
 		}
+		if (owned && restore)
+			Execute("SELECT documentdb_api.coll_mod($1,$2,"
+					" json_build_object('collMod',$2,'enableUpdateDescription',false)::text::documentdb_core.bson)",
+					2, types, values, false);
 	}
 	Execute("DELETE FROM documentdb_changefeed.feeds"
 			" WHERE database_name=$1 AND collection_name=$2",
@@ -222,28 +253,44 @@ documentdb_changefeed_unregister(PG_FUNCTION_ARGS)
 }
 
 static char *
-Token(const Feed *feed, XLogRecPtr position, int64 ordinal)
+Token(const Feed *feed, XLogRecPtr position, int64 ordinal, TimestampTz observed)
 {
+	if (feed->owned)
+		return psprintf("cf2:%s:%X/%X:" INT64_FORMAT ":" INT64_FORMAT,
+						feed->generation, LSN_FORMAT_ARGS(position), ordinal, observed);
 	return psprintf("cf1:%s:%X/%X:" INT64_FORMAT, feed->generation,
 					LSN_FORMAT_ARGS(position), ordinal);
 }
 
 static void
 ParseToken(const char *token, const Feed *feed, XLogRecPtr *position,
-		   int64 *ordinal)
+		   int64 *ordinal, TimestampTz *observed)
 {
 	char generation[33];
 	unsigned high;
 	unsigned low;
 	int length = 0;
-	if (strlen(token) > 128 ||
-		sscanf(token, "cf1:%32[0-9a-f]:%X/%X:" INT64_FORMAT "%n",
-			   generation, &high, &low, ordinal, &length) != 4 ||
+	int fields;
+	if (feed->owned)
+		fields = sscanf(token, "cf2:%32[0-9a-f]:%X/%X:" INT64_FORMAT ":" INT64_FORMAT "%n",
+						generation, &high, &low, ordinal, observed, &length);
+	else
+		fields = sscanf(token, "cf1:%32[0-9a-f]:%X/%X:" INT64_FORMAT "%n",
+						generation, &high, &low, ordinal, &length);
+	if (strlen(token) > 128 || fields != (feed->owned ? 5 : 4) ||
 		token[length] != '\0' || strcmp(generation, feed->generation) != 0 ||
 		*ordinal < 0)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					   errmsg("invalid or out-of-scope changefeed token")));
 	*position = ((uint64) high << 32) | low;
+	if (feed->owned)
+	{
+		TimestampTz now = GetCurrentTimestamp();
+		if (*observed <= 0 || *observed > now ||
+			now - *observed >= (int64) ResumeRetentionSeconds * USECS_PER_SEC)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("changefeed checkpoint history expired")));
+	}
 }
 
 static char *
@@ -360,6 +407,70 @@ EventDocument(const bson_t *event, const char *token,
 	return bytes;
 }
 
+static bool
+ReadFeed(Oid *types, Datum *args, Feed *feed)
+{
+	Execute("SELECT f.relation_id,f.slot,f.generation,f.start_lsn,f.auto_owned,f.last_activity"
+			" FROM documentdb_changefeed.feeds f"
+			" JOIN documentdb_api_catalog.collections c"
+			" ON c.database_name=f.database_name AND c.collection_name=f.collection_name"
+			" WHERE f.database_name=$1 AND f.collection_name=$2"
+			" AND f.relation_id=to_regclass('documentdb_data.documents_' || c.collection_id)::oid"
+			" AND f.storage_id=pg_relation_filenode(f.relation_id)",
+			2, types, args, false);
+	if (SPI_processed != 1)
+		return false;
+	feed->relation = DatumGetObjectId(Column(1));
+	feed->slot = TextDatumGetCString(Column(2));
+	feed->generation = TextDatumGetCString(Column(3));
+	feed->start = DatumGetLSN(Column(4));
+	feed->owned = DatumGetBool(Column(5));
+	feed->lastActivity = DatumGetTimestampTz(Column(6));
+	return true;
+}
+
+static void
+ProvisionFeed(text *database, text *collection, Oid relation, bool replace)
+{
+	char *slot = CreateDemandSlot(relation);
+	Oid types[] = {TEXTOID, TEXTOID, TEXTOID, BOOLOID};
+	Datum values[] = {PointerGetDatum(database), PointerGetDatum(collection),
+					  CStringGetTextDatum(slot), BoolGetDatum(false)};
+	bool isNull;
+	bool enabled = false;
+
+	if (replace)
+		Execute("SELECT documentdb_changefeed.unregister_feed($1,$2)",
+				2, types, values, false);
+	Execute("SELECT options FROM documentdb_api_catalog.collections"
+			" WHERE database_name=$1 AND collection_name=$2", 2, types, values, false);
+	if (SPI_processed != 1)
+		ereport(ERROR, (errmsg("changefeed collection disappeared during activation")));
+	{
+		Datum value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isNull);
+		if (!isNull)
+		{
+			bson_t options;
+			bson_iter_t setting;
+			InitBson(value, &options);
+			enabled = bson_iter_init_find(&setting, &options, "enableUpdateDescription") &&
+				BSON_ITER_HOLDS_BOOL(&setting) && bson_iter_bool(&setting);
+		}
+	}
+	if (!enabled)
+		Execute("SELECT documentdb_api.coll_mod($1,$2,"
+				" json_build_object('collMod',$2,'enableUpdateDescription',true)::text::documentdb_core.bson)",
+				2, types, values, false);
+	Execute("SELECT documentdb_changefeed.register_feed($1,$2,$3,true)",
+			3, types, values, false);
+	values[3] = BoolGetDatum(!enabled);
+	Execute("UPDATE documentdb_changefeed.feeds SET auto_owned=true,"
+			" restore_update_description=$4,last_activity=clock_timestamp()"
+			" WHERE database_name=$1 AND collection_name=$2", 4, types, values, false);
+	Execute("DELETE FROM documentdb_changefeed.pending_slots WHERE slot=$1",
+			1, &types[2], &values[2], false);
+}
+
 Datum
 documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 {
@@ -385,12 +496,21 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 	Tuplestorestate *store;
 	TupleDesc descriptor;
 	bool hasMore = false;
+	TimestampTz observed = GetCurrentTimestamp();
+	Oid relation;
+	bool registered;
 
 	if (!ChangefeedEnabled || RecoveryInProgress())
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					   errmsg("reference changefeed provider is disabled")));
+	if (!ChangefeedPreloaded)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					   errmsg("changefeed requires preloading its library after DocumentDB and restarting PostgreSQL")));
 	ValidateNamespace(database);
 	ValidateNamespace(collection);
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					   errmsg("changefeed cannot open or poll inside a transaction that has performed writes")));
 	InitBson(PG_GETARG_DATUM(2), &options);
 	InitBson(PG_GETARG_DATUM(3), &cursor);
 	resume = ResumeToken(&options);
@@ -428,29 +548,42 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 	CheckRetention();
-	Execute("SELECT f.relation_id, f.slot, f.generation, f.start_lsn"
-			" FROM documentdb_changefeed.feeds f"
-			" JOIN documentdb_api_catalog.collections c"
-			" ON c.database_name=f.database_name AND c.collection_name=f.collection_name"
-			" WHERE f.database_name=$1 AND f.collection_name=$2"
-			" AND f.relation_id=('documentdb_data.documents_' || c.collection_id)::regclass"
-			" AND f.storage_id=pg_relation_filenode(f.relation_id)",
+	Execute("SELECT to_regclass('documentdb_data.documents_' || collection_id)::oid,shard_key"
+			" FROM documentdb_api_catalog.collections"
+			" WHERE database_name=$1 AND collection_name=$2 AND view_definition IS NULL",
 			2, types, args, true);
 	if (SPI_processed != 1)
-		ereport(ERROR, (errmsg("changefeed is not registered or collection history changed")));
-	feed.relation = DatumGetObjectId(Column(1));
-	feed.slot = TextDatumGetCString(Column(2));
-	feed.generation = TextDatumGetCString(Column(3));
-	feed.start = DatumGetLSN(Column(4));
-	if (pg_class_aclcheck(feed.relation, GetOuterUserId(), ACL_SELECT) != ACLCHECK_OK)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					   errmsg("changefeed requires an existing collection; absent namespaces are not supported")));
+	relation = DatumGetObjectId(Column(1));
+	if (pg_class_aclcheck(relation, GetOuterUserId(), ACL_SELECT) != ACLCHECK_OK)
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					   errmsg("changefeed requires collection read permission")));
 	{
+		bool isNull;
+		SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isNull);
+		if (!isNull)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						   errmsg("changefeed does not support sharded collections")));
 		Oid lockType = INT8OID;
-		Datum lockKey = Int64GetDatum(((uint64) 0x43463101 << 32) | feed.relation);
-		/* Serialize slot peeks without consuming another reader's history. */
+		Datum lockKey = Int64GetDatum(((uint64) 0x43463101 << 32) | relation);
 		Execute("SELECT pg_advisory_xact_lock($1)", 1, &lockType, &lockKey, true);
 	}
+	registered = ReadFeed(types, args, &feed);
+	if (!registered || (feed.owned &&
+		observed - feed.lastActivity >= (int64) ResumeRetentionSeconds * USECS_PER_SEC))
+	{
+		if (resume != NULL)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("changefeed checkpoint history expired or collection history changed")));
+		ProvisionFeed(database, collection, relation, registered);
+		AcceptInvalidationMessages();
+		if (!ReadFeed(types, args, &feed))
+			ereport(ERROR, (errmsg("changefeed activation did not establish a feed")));
+		observed = GetCurrentTimestamp();
+	}
+	else if (feed.owned && !DemandMaintenanceRunning())
+		StartDemandMaintenance();
 	{
 		Oid slotType = TEXTOID;
 		Datum slotValue = CStringGetTextDatum(feed.slot);
@@ -462,7 +595,7 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 		if (SPI_processed != 1)
 			ereport(ERROR, (errmsg("changefeed slot or retained history is unavailable")));
 		horizon = DatumGetLSN(Column(3));
-		if (DatumGetLSN(Column(2)) != feed.start)
+		if (!feed.owned && DatumGetLSN(Column(2)) != feed.start)
 			ereport(ERROR, (errmsg("changefeed slot has been advanced or replaced")));
 		if (horizon - DatumGetLSN(Column(1)) > 256 * 1024 * 1024)
 			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -470,7 +603,7 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 		position = horizon;
 		if (resume != NULL)
 		{
-			ParseToken(resume, &feed, &position, &ordinal);
+			ParseToken(resume, &feed, &position, &ordinal, &observed);
 			if (position < feed.start || position < DatumGetLSN(Column(2)) ||
 				position > horizon)
 				ereport(ERROR, (errmsg("changefeed checkpoint history is unavailable")));
@@ -523,7 +656,15 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 				hasMore = true;
 				break;
 			}
-			rawToken = Token(&feed, current, currentOrdinal);
+			if (feed.owned)
+			{
+				if (!bson_iter_init_find(&field, &event, "wallTime") ||
+					!BSON_ITER_HOLDS_DATE_TIME(&field))
+					ereport(ERROR, (errmsg("changefeed output is missing commit time")));
+				observed = (bson_iter_date_time(&field) -
+							(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * INT64CONST(86400000)) * 1000;
+			}
+			rawToken = Token(&feed, current, currentOrdinal, observed);
 			delivered = EventDocument(&event, rawToken, text_to_cstring(database),
 									  text_to_cstring(collection));
 			if (VARSIZE_ANY_EXHDR(delivered) > batchBytes - bytes)
@@ -546,13 +687,19 @@ documentdb_changefeed_aggregate(PG_FUNCTION_ARGS)
 		{
 			position = horizon;
 			ordinal = 0;
+			observed = GetCurrentTimestamp();
 		}
 	}
 	{
-		Datum values[] = {0, PointerGetDatum(Continuation(Token(&feed, position, ordinal)))};
+		Datum values[] = {0, PointerGetDatum(Continuation(Token(&feed, position, ordinal, observed)))};
 		bool nulls[] = {true, false};
 		tuplestore_putvalues(store, descriptor, values, nulls);
 	}
+	if (feed.owned)
+		Execute("UPDATE documentdb_changefeed.feeds SET last_activity=clock_timestamp()"
+				" WHERE database_name=$1 AND collection_name=$2 AND generation=$3",
+				3, (Oid[]) {TEXTOID, TEXTOID, TEXTOID},
+				(Datum[]) {args[0], args[1], CStringGetTextDatum(feed.generation)}, false);
 	SPI_finish();
 	return (Datum) 0;
 }

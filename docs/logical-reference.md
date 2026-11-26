@@ -12,7 +12,7 @@ uses the existing public tracker and a transactional logical-message adapter.
 Pre-images, timestamp
 starts, distribution, archive access, and durable failover are explicitly
 unsupported. Unsupported mutations must fail rather than disappear or be
-mislabelled. Updates require explicit capture registration; a document diff is
+mislabelled. Normal watch requests activate update capture; a document diff is
 not a substitute for the existing update-tracker contract.
 
 The native-WAL decoder remains an independent feasibility experiment. Its
@@ -33,8 +33,8 @@ raw token in `rt`; the cursor machinery base64-encodes it into
 
 The provider has one owner and no hook chaining. Preloading its library after
 DocumentDB installs the existing availability callback. An explicit,
-superuser-controlled `documentdb_changefeed.enable` setting gates serving.
-Extension installation does not enable it.
+superuser-controlled `documentdb_changefeed.enable` setting gates serving and
+defaults to enabled. Installation makes the capability available, not capture.
 
 ## Logical decoding and retention
 
@@ -43,32 +43,35 @@ transaction reconstruction, abort/subtransaction handling, and inserted TOAST
 reconstruction. The plugin returns typed BSON events rather than diagnostic
 text. It filters one exact relation, not a table-name prefix.
 
-An administrator creates a logical slot using this output plugin and registers
-that existing slot for one collection. Registration does not create slots,
-silently change identity, or own the lifetime of an administrator's slot.
-Unregistering the feed does not drop the slot.
+Normal watches automatically provision an owned slot and capture for one
+existing collection. An administrator may still register an existing slot for
+diagnostics. Manual registration does not take ownership of that slot or change
+replica identity. Unregistering drops an automatically owned slot, but never an
+administrator's slot.
 
 Reads peek rather than consume the slot. Independent readers can replay the
 same retained history without advancing one another. A per-feed,
 transaction-scoped advisory lock serializes decoding; readers can wait behind
-another reader's poll or enclosing transaction. This simple milestone has no
-automatic slot advancement or retention worker.
-The administrator must close unused feeds and drop their slots.
+another reader's poll or enclosing transaction. Background maintenance advances
+only owned slots using timed WAL checkpoints and reclaims idle capture.
+Manual feeds still require administrator cleanup.
+See [the demand-capture design](demand-capture.md) for the retention policy.
 
 Require a finite positive `max_slot_wal_keep_size`. Reject a read when the
 retained scan exceeds 256 MiB, a returned batch exceeds its byte budget, or
 decoding exceeds its bounded output budget. A checkpoint-enforced WAL budget
 is not an instantaneous disk cap. A lost slot/history produces an error,
 not a reset-to-now.
-Externally advanced/replaced slots and two-phase slots are rejected.
+Externally advanced manual slots and two-phase slots are rejected.
 
 First subscription starts at the durable current WAL boundary, not at slot
-creation. Because the slot retains earlier WAL, transactions that wrote after
+creation. For a manual slot, transactions that wrote after
 slot creation but commit after subscription can still be reconstructed.
 The POC does not promise to recover transactions whose writes predate the slot.
 
 Tokens identify the registered slot generation, relation, commit position,
-and event ordinal. They are opaque, scope-checked reference tokens, not
+and event ordinal. Owned-feed tokens also carry an age boundary enforced by
+`resume_retention`. They are opaque, scope-checked reference tokens, not
 authenticated production credentials. Authorization is checked on each read.
 Do not accept tokens from the native-WAL diagnostic or another provider.
 `clusterTime` uses the commit's timestamp in seconds and the commit LSN's low
@@ -104,5 +107,5 @@ include this library where that setting exists.
 5. Unauthorized reads, cross-collection tokens, disabled-provider behavior,
    unregister/slot cleanup, and unchanged ordinary collection operations.
 
-Update-description support is a dependent milestone described separately.
-Automatic retention remains future work, not implied by this provider proof.
+Update-description support and demand-driven retention are described separately.
+Absent namespaces and broader lifecycle coverage remain future work.

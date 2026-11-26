@@ -1,7 +1,7 @@
 EXTENSION = documentdb_changefeed
 MODULE_big = pg_documentdb_changefeed
-OBJS = src/extension.o src/wal_decoder.o src/logical_output.o src/logical_provider.o src/update_capture.o
-DATA = sql/documentdb_changefeed--0.1.0.sql
+OBJS = src/extension.o src/wal_decoder.o src/logical_output.o src/logical_provider.o src/update_capture.o src/demand_capture.o
+DATA = $(wildcard sql/documentdb_changefeed--*.sql)
 PGFILEDESC = "documentdb_changefeed - experimental logical changefeed provider"
 
 DOCUMENTDB_SOURCE ?= /opt/documentdb-source

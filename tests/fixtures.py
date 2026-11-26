@@ -110,7 +110,7 @@ def main():
         LANGUAGE C STRICT;
         """,
     )
-    assert query(connection, "SELECT fixture_version()")[0][0] == "0.1.0-dev"
+    assert query(connection, "SELECT fixture_version()")[0][0] == "0.2.0-dev"
     install_decoder(connection)
     query(
         connection,

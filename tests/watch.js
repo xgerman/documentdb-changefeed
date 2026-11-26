@@ -19,10 +19,11 @@ async function main() {
     const authenticated = await admin.auth("cf_client", process.env.CF_TEST_PASSWORD);
     check.equal(authenticated.ok, 1);
     const collection = db.getSiblingDB("cf_watch").events;
-    const first = await collection.watch([], { batchSize: 1, maxAwaitTimeMS: 50 });
-    const second = await collection.watch([], { batchSize: 1, maxAwaitTimeMS: 50 });
-    check.equal(await first.tryNext(), null);
-    check.equal(await second.tryNext(), null);
+    const [first, second] = await Promise.all([
+        collection.watch([], { batchSize: 1, maxAwaitTimeMS: 50 }),
+        collection.watch([], { batchSize: 1, maxAwaitTimeMS: 50 })
+    ]);
+    check.deepEqual(await Promise.all([first.tryNext(), second.tryNext()]), [null, null]);
     await collection.insertMany([{ _id: "one", value: 1 }, { _id: "two", value: 2 }]);
     const one = await nextEvent(first);
     check.equal(one.operationType, "insert");
